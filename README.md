@@ -8,9 +8,15 @@ benchmark → clean up**, with pinned weights, a least-privilege IAM story, and 
 cost guard.
 
 Strands Decider 2B is the small, open decision model Kiro Crew can run instead of
-the default hosted "Jev" service. Self-hosting it on SageMaker keeps every request
-inside your account — the request is SigV4-signed with your own credentials, and
-**no data leaves your account**.
+the default hosted "Jev" service. Self-hosting it on SageMaker sends each decision
+to an endpoint in your own account, SigV4-signed with your own credentials,
+instead of to a third-party API.
+
+**Verified end to end:** Kiro Crew 0.12.0's gateway sent live `tool.risk`
+decisions to this endpoint and got answers in 2.2 to 8.9 s, matched one for one by
+CloudWatch invocations. The limit: the 39-candidate skill choice takes ~32 s on
+CPU, past Kiro Crew's 10 s wait cap. See [Gateway proof](#gateway-proof) and
+[Which decisions fit](#which-decisions-fit).
 
 > This repo deploys **nothing by itself**. You run the scripts against your own
 > account. Standing up a real-time endpoint costs money while it runs (see
@@ -140,10 +146,57 @@ answers. The least-privilege invoke-only role was proven end to end:
 `InvokeEndpoint` **succeeded** under the assumed role while `DescribeEndpoint` was
 **denied**, exactly as scoped.
 
-**Not proven:** a decision routed *through the Kiro Crew gateway* to this endpoint
-— see [Troubleshooting](#troubleshooting) (the consent bound to the Jev default
-URL, so the gateway's decision failed `provider` in 2 ms and CloudWatch recorded
-**zero** invocations from it). Everything above is direct, signed boto3 calls.
+Those are direct, signed boto3 calls. The gateway-routed proof came in a second
+run, below.
+
+### Gateway proof
+
+On the second run (2026-11-09, endpoint InService 21:20:29Z), Kiro Crew's gateway
+routed real decisions to the endpoint. Four `tool.risk` decisions in the 21:37Z
+minute, from `decisions-20261109.jsonl` (session and turn IDs removed):
+
+| Time (UTC) | Tool | latency_ms | error | Answer | input_tokens |
+|---|---|---|---|---|---|
+| 21:37:04.718 | `read` | 2180 | null | risk=safe, p=0.5714 | 228 |
+| 21:37:23.002 | `session_send` | 4341 | null | risk=caution, p=0.5109 | 519 |
+| 21:37:25.238 | `work_ledger_record` | 2226 | null | risk=caution, p=0.4498 | 266 |
+| 21:37:48.341 | `shell` | 8933 | null | risk=caution, p=0.3849 | 986 |
+
+Every line names `provider_model: strands-decider-2b`. CloudWatch
+(`AWS/SageMaker`, `EndpointName=cb-speedrun-2-decider`, `VariantName=v1`) for the
+same minute: **Invocations = 4**, ModelLatency sum **17.38 s** against the
+gateway's summed latency_ms of **17.68 s**; the 0.3 s gap is network. 4XX and 5XX
+errors were 0 throughout.
+
+Two `skills.select` decisions (39 skill candidates) at 21:24:13Z and 21:24:38Z
+also reached the endpoint: one CloudWatch invocation in each of the 21:24 and
+21:25 minutes, ModelLatency **31.95 s** and **32.65 s**. Kiro Crew had already
+given up and logged `error: "timeout"`.
+One more invocation at 21:34Z (ModelLatency 29.4 s) has no matching log line;
+most likely a call whose result arrived after the gateway gave up, not confirmed.
+
+To check your own: follow [`scripts/connect_kiro_crew.md`](scripts/connect_kiro_crew.md),
+then compare the decision-log lines for one UTC minute with CloudWatch
+`Invocations` and `ModelLatency` for that minute.
+
+### Which decisions fit
+
+Each decision point waits at most a fixed cap, whatever
+`decisions.provider.timeout_ms` says (`MAX_WAIT_SECS` in Kiro Crew 0.12.0
+`kiro_crew/decisions/points/`):
+
+| Decision point | Request size | Latency on ml.m5.2xlarge | Wait cap | Verdict |
+|---|---|---|---|---|
+| `tool.risk` (Risky tool-call notes) | 228 to 986 input tokens | 2.2 to 8.9 s, measured | 10 s | works |
+| `skills.select` (Automatic skill choice) | 39 skill candidates | ~32 s model time, measured | 10 s | too slow on this CPU instance |
+| `compaction.keep` | not measured | not measured | 10 s | untested |
+| `memory.recall` | not measured | not measured | 7 s | untested |
+| `message.steer`, `model.route`, `nudge.wake` | not measured | not measured | `timeout_ms` only | untested |
+
+Production advice: turn on short points like `tool.risk`; keep skill choice on Jev
+or the local model, or try a faster instance. The `ml.g4dn.xlarge` endpoint quota
+was 0 on the author's account, so a GPU endpoint is untested. The 8.9 s `shell`
+check is close to the cap, so long tool inputs may still time out.
 
 ### Latency (35 calls, 0 errors)
 
@@ -186,14 +239,17 @@ One `ml.m5.2xlarge` handles ~0.3–0.4 req/s regardless of how many callers pile
 on; extra callers just queue. To serve more, add instances (raise
 `InitialInstanceCount` / use autoscaling), don't push concurrency at one instance.
 
-### Cost of this run
+### Cost of both runs
 
 | Item | Duration | Cost |
 |---|---|---|
-| Endpoint (attempt 1 broken image + attempt 2 working) | 74.2 min = **1.236 hr** × $0.485 | **$0.60** |
-| CodeBuild (2 builds, `GENERAL1_SMALL`) | ~5 min | ~$0.03 |
+| Run 1, attempt 1 (broken image, Failed) | 0.407 endpoint-hours | $0.197 |
+| Run 1, attempt 2 (working) | 0.829 endpoint-hours | $0.402 |
+| Run 2 (gateway proof) | 0.354 endpoint-hours | $0.172 |
+| **Endpoint total** | **1.591 hr** × $0.485 | **$0.77** |
+| CodeBuild (3 builds, `GENERAL1_SMALL`) | ~2 to 3 min each | ~$0.04 |
 | S3 / ECR storage | — | <$0.01 |
-| **Total** | | **≈ $0.63** |
+| **Total** | | **≈ $0.81** |
 
 The $10 monthly Budget guarded it. Left running, the same endpoint is ~$354/mo
 (see [Cost](#cost)) — which is why `cleanup.sh` runs at the end.
@@ -236,10 +292,9 @@ hard stop — AWS Budgets **alert**, they do not cap spend, so tear down promptl
   invoke-only policy each name exactly the one bucket / repo / endpoint they need.
   The invoke-only policy grants a single action (`sagemaker:InvokeEndpoint`) on a
   single endpoint ARN.
-- **No data leaves your account.** Kiro Crew's `sagemaker://` route calls only
+- **Where requests go.** Kiro Crew's `sagemaker://` route calls only
   `sagemaker:InvokeEndpoint`, always to `runtime.sagemaker.<region>.amazonaws.com`,
-  SigV4-signed with your own credentials. No API key is read or sent, and nothing
-  logs the request, response, images or credentials.
+  SigV4-signed with your own credentials. No API key is read or sent.
 - **S3 is private** (all public access blocked, SSE-S3, versioned); the ECR repo
   scans images on push and uses immutable tags.
 - **No secrets in the repo.** There are no account IDs, user ARNs or keys — grep
@@ -263,8 +318,11 @@ hard stop — AWS Budgets **alert**, they do not cap spend, so tear down promptl
   scales with the number of questions in the body (220 B → ~0.9 s, 3155 B →
   ~8.9 s). Fine for Kiro Crew's decision cadence, not for interactive per-token
   use. It also exceeds Kiro Crew's **default 1000 ms decision timeout**, so raise
-  `decisions.provider.timeout_ms` to ~5000 before routing live decisions (see
-  Troubleshooting).
+  `decisions.provider.timeout_ms` before routing live decisions. Raising it past
+  10000 does nothing: each decision point clamps its wait to a fixed cap (10 s for
+  `tool.risk`, `skills.select` and `compaction.keep`, 7 s for `memory.recall`), so
+  the ~32 s skill choice can never finish on this CPU instance (see
+  [Which decisions fit](#which-decisions-fit)).
 - **One instance serializes requests.** A single `ml.m5.2xlarge` sustains only
   ~0.3–0.4 req/s; concurrent callers queue rather than parallelize (p50 rose
   2.8 s → 27 s from 1 → 8 callers, throughput flat, 0 errors). Scale out with more
@@ -302,25 +360,25 @@ Real gaps hit while deploying and verifying this, and how each was fixed:
 - **Kiro Crew's decision times out before the endpoint answers.** The default
   decision timeout is **1000 ms**, but a real CPU call to this endpoint takes
   **~2900 ms**, so every decision times out and falls back. Raise it:
-  `kirocrew config set decisions.provider.timeout_ms 5000`.
+  `kirocrew config set decisions.provider.timeout_ms 10000` (higher values are
+  clamped to each point's 10 s cap).
 - **Kiro Crew keeps calling Jev even after you set the `sagemaker://` endpoint.**
-  Consent binds to the endpoint **string**, and it is granted by the **Decisions
-  consent card in the dashboard**, not by `config.json`. If the card was turned on
-  while the endpoint was still the Jev default (`https://api.typesafe.ai/...`), the
-  running gateway's consent keystone wins and overrides a `kirocrew config set
-  ... sagemaker://...`. That is exactly what happened on the author's run: the
-  gateway decision fired (`point: skills.select`) but failed `error: "provider"`
-  with `latency_ms: 2`, and CloudWatch recorded **zero** invocations from it — the
-  call never reached the endpoint. **Do it in this order:**
-  1. `kirocrew config set decisions.provider.endpoint "sagemaker://<name>?region=<r>"`
-  2. `kirocrew config set decisions.provider.timeout_ms 5000`
-  3. **then** grant Decisions consent in the dashboard card, so consent binds to
-     the `sagemaker://` URL (not to the Jev default).
-  4. Trigger a decision and check the newest
-     `~/.kiro/crew/decisions/decisions-YYYYMMDD.jsonl` line for `latency_ms` in the
-     **thousands** and **no `error` field** — that is the signal the endpoint
-     answered. *(This gateway-routed step is not yet verified by the author; the
-     endpoint itself is proven by 37 direct signed `InvokeEndpoint` calls.)*
+  Consent binds to the endpoint string the dashboard card **displays** when you
+  grant it; the consent PUT must echo that string, or it returns `409`. On the
+  author's first run a Settings tab loaded before `kirocrew config set` still
+  showed the Jev URL, so consent bound to Jev: the gateway's `skills.select`
+  decision failed `error: "provider"` in 2 ms and CloudWatch recorded zero
+  invocations. **The order that worked on the second run:**
+  1. `kirocrew config set` the endpoint, model and `timeout_ms`.
+  2. Hard-reload the dashboard.
+  3. Check Settings > Developer > Decisions reads "Sent to sagemaker://...".
+  4. Then turn on Decisions.
+  Consent pins only on/off plus the endpoint string, so later `timeout_ms` changes
+  keep it. Full steps: [`scripts/connect_kiro_crew.md`](scripts/connect_kiro_crew.md).
+- **Skill choice always times out.** `skills.select` with 39 candidates took ~32 s
+  of model time on `ml.m5.2xlarge`, and the point waits at most 10 s
+  (`MAX_WAIT_SECS = 10.0` in `skills_select.py`). Leave Automatic skill choice on
+  Jev or the local model, or use a faster instance.
 - **`CreateModel` fails with a misleading "role is invalid".** A SageMaker
   execution role created in the console often carries the IAM path
   `/service-role/`, so its real ARN is
