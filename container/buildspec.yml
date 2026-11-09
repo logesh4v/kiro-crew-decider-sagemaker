@@ -1,0 +1,20 @@
+version: 0.2
+
+# ACCOUNT, REGION, REPO and TAG are injected by the CloudFormation CodeBuild
+# project (infra/template.yaml) from AWS::AccountId / AWS::Region / ProjectName,
+# so nothing account-specific is hardcoded here.
+
+phases:
+  pre_build:
+    commands:
+      - echo Logging in to ECR...
+      - aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$ACCOUNT.dkr.ecr.$REGION.amazonaws.com"
+  build:
+    commands:
+      - echo Building image...
+      - docker build -t "$ACCOUNT.dkr.ecr.$REGION.amazonaws.com/$REPO:$TAG" .
+  post_build:
+    commands:
+      - echo Pushing image...
+      - docker push "$ACCOUNT.dkr.ecr.$REGION.amazonaws.com/$REPO:$TAG"
+      - echo Done.

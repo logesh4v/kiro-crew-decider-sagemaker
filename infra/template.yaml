@@ -1,0 +1,302 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Strands Decider 2B on Amazon SageMaker (CB Speed Run 2). Creates the S3 bucket
+  and ECR repo for the model artifact and serving image, a CodeBuild project+role
+  that builds the image, a monthly cost Budget, the least-privilege invoke-only
+  IAM policy, and -- once the image and weights exist -- the SageMaker model,
+  endpoint config and real-time endpoint. Deploy in two passes: foundation first
+  (CreateEndpoint=false), then flip CreateEndpoint=true after the image is in ECR
+  and model.tar.gz is in S3. No account IDs are baked in; everything derives from
+  AWS::AccountId / AWS::Region or parameters.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: cb-speedrun-2-decider
+    Description: Name prefix / endpoint name for all resources.
+    AllowedPattern: "[a-zA-Z0-9-]+"
+    MaxLength: 42
+
+  InstanceType:
+    Type: String
+    Default: ml.m5.2xlarge
+    Description: >-
+      SageMaker endpoint instance type. Default ml.m5.2xlarge (CPU, 32 GB,
+      ~$0.485/hr in ap-south-1). Use ml.g4dn.xlarge for GPU (~$0.81/hr) if your
+      account has that endpoint-usage quota.
+    AllowedValues:
+      - ml.m5.2xlarge
+      - ml.m5.4xlarge
+      - ml.c5.2xlarge
+      - ml.g4dn.xlarge
+
+  BudgetLimitUsd:
+    Type: Number
+    Default: 10
+    Description: Monthly cost budget ceiling in USD. Alerts at 50%, 100% actual and 100% forecast.
+    MinValue: 1
+
+  BudgetEmail:
+    Type: String
+    Description: Email address that receives budget alerts (Budgets email subscribers need no confirmation).
+    AllowedPattern: "[^@\\s]+@[^@\\s]+\\.[^@\\s]+"
+
+  CreateEndpoint:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Set true ONLY after the serving image is in ECR and model.tar.gz is in S3.
+      When true, creates the SageMaker model, endpoint config and endpoint (which
+      starts billing at the InstanceType hourly rate).
+
+  ImageUri:
+    Type: String
+    Default: "set-me-when-CreateEndpoint-true"
+    Description: >-
+      Full ECR image URI (e.g. <acct>.dkr.ecr.<region>.amazonaws.com/<repo>:v1).
+      Required only when CreateEndpoint=true; deploy.sh fills it from the stack's
+      RepositoryUri output on the second pass.
+
+  ModelDataS3Key:
+    Type: String
+    Default: model/model.tar.gz
+    Description: S3 key of model.tar.gz within the created bucket. Required when CreateEndpoint=true.
+
+Conditions:
+  MakeEndpoint: !Equals [!Ref CreateEndpoint, "true"]
+
+Resources:
+
+  # ---- Artifact storage ---------------------------------------------------
+  ModelBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub "${ProjectName}-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  ModelRepo:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RepositoryName: !Ref ProjectName
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: IMMUTABLE
+
+  # ---- Build: CodeBuild role + project ------------------------------------
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-codebuild"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: build-perms
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}-build*"
+              - Sid: EcrAuth
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: EcrPush
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !GetAtt ModelRepo.Arn
+              - Sid: S3Source
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${ModelBucket.Arn}/*"
+
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${ProjectName}-build"
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts: { Type: NO_ARTIFACTS }
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/standard:7.0
+        ComputeType: BUILD_GENERAL1_SMALL
+        PrivilegedMode: true  # required to run the Docker daemon for docker build
+        EnvironmentVariables:
+          - { Name: ACCOUNT, Value: !Ref "AWS::AccountId" }
+          - { Name: REGION, Value: !Ref "AWS::Region" }
+          - { Name: REPO, Value: !Ref ProjectName }
+          - { Name: TAG, Value: v1 }
+      Source:
+        Type: S3
+        Location: !Sub "${ModelBucket}/source/source.zip"
+      TimeoutInMinutes: 30
+
+  # ---- Least-privilege invoke-only policy (the IAM proof) -----------------
+  # A standalone managed policy granting ONLY sagemaker:InvokeEndpoint on this one
+  # endpoint. Attach it to whatever principal (user/role) should be allowed to
+  # call the endpoint -- nothing else can.
+  InvokeOnlyPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${ProjectName}-invoke-only"
+      Description: Allows ONLY InvokeEndpoint on the one Strands Decider endpoint.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: InvokeOneEndpointOnly
+            Effect: Allow
+            Action: sagemaker:InvokeEndpoint
+            Resource: !Sub "arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/${ProjectName}"
+
+  # ---- SageMaker execution role (pulls image, reads model.tar.gz) ---------
+  SageMakerExecRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-sm-exec"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: sagemaker.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: pull-and-read
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: EcrAuth
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: EcrPull
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !GetAtt ModelRepo.Arn
+              - Sid: S3ReadModel
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${ModelBucket.Arn}/*"
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/sagemaker/Endpoints/*"
+
+  # ---- SageMaker model + endpoint (second pass: CreateEndpoint=true) ------
+  Model:
+    Type: AWS::SageMaker::Model
+    Condition: MakeEndpoint
+    Properties:
+      ModelName: !Ref ProjectName
+      ExecutionRoleArn: !GetAtt SageMakerExecRole.Arn
+      PrimaryContainer:
+        Image: !Ref ImageUri
+        ModelDataUrl: !Sub "s3://${ModelBucket}/${ModelDataS3Key}"
+
+  EndpointConfig:
+    Type: AWS::SageMaker::EndpointConfig
+    Condition: MakeEndpoint
+    Properties:
+      EndpointConfigName: !Sub "${ProjectName}-cfg"
+      ProductionVariants:
+        - VariantName: v1
+          ModelName: !GetAtt Model.ModelName
+          InitialInstanceCount: 1
+          InstanceType: !Ref InstanceType
+          InitialVariantWeight: 1.0
+
+  Endpoint:
+    Type: AWS::SageMaker::Endpoint
+    Condition: MakeEndpoint
+    Properties:
+      EndpointName: !Ref ProjectName
+      EndpointConfigName: !GetAtt EndpointConfig.EndpointConfigName
+
+  # ---- Cost guard: monthly Budget -----------------------------------------
+  CostBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub "${ProjectName}-cap"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref BudgetLimitUsd
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 50
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - { SubscriptionType: EMAIL, Address: !Ref BudgetEmail }
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - { SubscriptionType: EMAIL, Address: !Ref BudgetEmail }
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - { SubscriptionType: EMAIL, Address: !Ref BudgetEmail }
+
+Outputs:
+  BucketName:
+    Description: S3 bucket for source.zip and model.tar.gz.
+    Value: !Ref ModelBucket
+  RepositoryUri:
+    Description: ECR repo URI to tag and push the serving image to.
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}"
+  CodeBuildProject:
+    Description: CodeBuild project that builds and pushes the image.
+    Value: !Ref BuildProject
+  InvokeOnlyPolicyArn:
+    Description: Attach this to a principal to grant invoke-only access.
+    Value: !Ref InvokeOnlyPolicy
+  EndpointName:
+    Description: SageMaker endpoint name (exists only when CreateEndpoint=true).
+    Value: !If [MakeEndpoint, !GetAtt Endpoint.EndpointName, "not-created"]
+  KiroCrewEndpointSetting:
+    Description: The sagemaker:// value to set in Kiro Crew.
+    Value: !Sub "sagemaker://${ProjectName}?region=${AWS::Region}"

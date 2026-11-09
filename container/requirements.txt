@@ -1,0 +1,17 @@
+# Serving image deps for Strands Decider 2B on SageMaker (CPU).
+# Pins mirror Kiro Crew 0.12.0's strands-decider-2b.requirements.txt so the
+# container runs the same code as the local launcher. torch is the CPU build
+# (installed from the PyTorch CPU index in the Dockerfile).
+accelerate==1.15.0
+fastapi==0.142.2
+huggingface-hub==1.33.0
+numpy==2.5.3
+peft==0.21.2
+pydantic==2.13.5
+safetensors==0.8.0
+starlette==1.7.0
+tokenizers==0.23.2
+torch==2.14.1
+transformers==5.18.0
+uvicorn==0.54.0
+strands-decider @ https://github.com/strands-labs/strands-decider/archive/fe39fad9ec8ec355993f76b977348d915ec9cb65.tar.gz

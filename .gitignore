@@ -1,0 +1,19 @@
+# Model weights and the packaged artifact are large (3.4 GB) and are fetched +
+# verified by weights/download_weights.py from the pinned manifest. They never
+# belong in git.
+weights/files/
+weights/model.tar.gz
+weights/checksums.json
+
+# Build context produced by deploy.sh
+source.zip
+
+# Python / tooling
+__pycache__/
+*.pyc
+.venv/
+.venv-*/
+*.egg-info/
+
+# OS
+.DS_Store
