@@ -18,7 +18,12 @@ Write the three values down. The default endpoint is the hosted Jev service
 (`https://api.typesafe.ai/v1/systemone`, model `jev-latest`); pointing at your own
 endpoint replaces it only while you have it set.
 
-## 2. Point Kiro Crew at your endpoint
+## 2. Point Kiro Crew at your endpoint — and raise the timeout — BEFORE consent
+
+Order matters. **Consent binds to whatever endpoint string is set at the moment
+you grant it in the dashboard.** If you grant consent while the endpoint is still
+the Jev default, the running gateway keeps calling Jev and ignores a later
+`config set`. So set the endpoint (and the timeout) *first*, then grant consent.
 
 The endpoint string is exactly (from the stack's `KiroCrewEndpointSetting` output):
 
@@ -33,37 +38,49 @@ accepted.
 ```bash
 kirocrew config set decisions.provider.endpoint "sagemaker://cb-speedrun-2-decider?region=ap-south-1"
 kirocrew config set decisions.provider.model "strands-decider-2b"
+# A real CPU call takes ~2.9 s; the default decision timeout is 1000 ms, so raise it
+# or every decision times out and falls back to Jev:
+kirocrew config set decisions.provider.timeout_ms 5000
 ```
 
 Changing the endpoint name, region or profile **withdraws consent** for the old
 one — Kiro Crew treats each distinct endpoint string as a separate opt-in.
 
-## 3. Turn Decisions on
+## 3. Turn Decisions on, THEN grant consent in the dashboard
 
 ```bash
 kirocrew config set decisions.enabled true
 ```
 
-All five Jev decision switches are off by default. Enabling `decisions.enabled`
-lets Kiro Crew route the decisions you have turned on (model routing, acceptance
-evaluation, etc.) through the endpoint. On a timeout or failure Kiro Crew falls
-back gracefully; scheduled jobs and sub-agents are never routed through it.
+All five Jev decision switches are off by default. Now open the **Decisions
+consent card in the dashboard and grant consent** — with the `sagemaker://` URL
+already set in step 2, consent binds to *that* URL. A `kirocrew config set` alone
+**cannot** grant consent; the dashboard card is the only thing that does, and the
+running gateway's consent keystone wins over config. On a timeout or failure Kiro
+Crew falls back gracefully; scheduled jobs and sub-agents are never routed
+through it.
 
-## 4. Trigger a few decisions, then read the decision log
+## 4. Trigger a decision, then check the decision log
 
 Do something that makes Kiro Crew decide (e.g. ask it to route a task, or run a
-flow that uses acceptance evaluation). Then read the decision log — Kiro Crew
-records each decision (which endpoint answered, latency, outcome) to its gateway
-log:
+flow that uses acceptance evaluation). Then read the newest decision-log line:
 
 ```bash
-# tail the gateway log and look for the decision lines naming your endpoint:
-tail -n 200 ~/.kiro/crew/logs/gateway.log | grep -i -E "decision|sagemaker|systemone"
+tail -n 5 ~/.kiro/crew/decisions/decisions-$(date -u +%Y%m%d).jsonl
 ```
 
-(If your install logs elsewhere, use the Decisions view in the dashboard, or
-`kirocrew logs` for the gateway stream.) You should see the decision routed to
-`cb-speedrun-2-decider`, not to `api.typesafe.ai`.
+A decision that actually reached your endpoint shows **`latency_ms` in the
+thousands** (a real SageMaker call measures ~2900 ms) and **no `error` field**. If
+you instead see `error: "provider"` with `latency_ms: 2`, consent is still bound
+to the Jev default — re-check step 2/3 order. You can cross-check with CloudWatch
+(`AWS/SageMaker` → `Invocations`, `EndpointName=<name>`): a routed decision adds a
+data point; a 2 ms failure adds none.
+
+> **Not yet verified by the author.** On the author's run the endpoint itself was
+> proven by 37 direct signed `InvokeEndpoint` calls, but the *gateway-routed*
+> decision had not yet landed on the endpoint (consent had bound to the Jev URL).
+> The steps above are the fix to try; confirm the thousands-ms, no-error log line
+> yourself.
 
 ## 5. Restore your original settings
 

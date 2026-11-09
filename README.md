@@ -48,10 +48,21 @@ LICENSE             MIT (author: S Logesh)
 
 ![Kiro Crew decision model on a SageMaker real-time endpoint](docs/diagram.png)
 
-*Kiro Crew's decision gate signs each decision with SigV4 and calls
-`InvokeEndpoint` on a SageMaker real-time endpoint in your account. The container
-(image from Amazon ECR, weights from Amazon S3) answers the same `/v1/systemone`
-body. An IAM policy allows `InvokeEndpoint` on that one endpoint ARN only.*
+*At request time (solid, 1–4), Kiro Crew's decision gate on the developer's Mac —
+signing each call with SigV4 through the AWS SDK (boto3), no API key — makes a
+signed `InvokeEndpoint` call (1) to the Amazon SageMaker real-time endpoint
+(`ml.m5.2xlarge`, 1 instance) in ap-south-1, which routes to the container (2)
+whose FastAPI `/invocations` hands off to the in-container `strands_decider`
+`/v1/systemone` model (3, Strands Decider 2B, ~12 GB resident) and returns the
+decision JSON (4, warm p50 ~2.9 s), scoped by a global invoke-only IAM role the
+caller assumes (`sts:AssumeRole`, then `InvokeEndpoint` on one endpoint ARN). At
+deploy time (dashed, A–D), the pinned sha256-verified weights are packaged as
+`model.tar.gz` into Amazon S3 (A) and `source.zip` is built by AWS CodeBuild into
+an image pushed to Amazon ECR (B); the SageMaker execution IAM role (C) reads the
+model from S3 and pulls the image from ECR, and CreateEndpoint (D) stands the
+endpoint up from that model and image — with Amazon CloudWatch collecting endpoint
+logs and ModelLatency/OverheadLatency, and an account-level AWS Budget sending
+$5/$10 email alerts.*
 
 ```
                  build time                          serve time
@@ -117,33 +128,75 @@ never pay for an endpoint before the image and weights exist.
 ## Results
 
 Measured on a real deployment in `ap-south-1` on an `ml.m5.2xlarge` endpoint
-(2026-11-09). The endpoint was torn down right after — these are the numbers you
-should expect to reproduce, not a live service.
+(1 instance), called from a Mac in India (2026-11-09). The endpoint was torn down
+right after — these are numbers to expect when you reproduce, not a live service.
+
+**What is proven:** **37 signed `InvokeEndpoint` calls** (a smoke call, a 35-call
+benchmark, and the invoke-proof) completed with **0 errors**, each carrying Kiro
+Crew's exact `/v1/systemone` body and returning a valid answer. A sample answer
+came back with a full probability distribution — e.g. `action: "hold"` with
+`{merge: 0.14, hold: 0.43, request_changes: 0.43}`, plus `noul` and `score`
+answers. The least-privilege invoke-only role was proven end to end:
+`InvokeEndpoint` **succeeded** under the assumed role while `DescribeEndpoint` was
+**denied**, exactly as scoped.
+
+**Not proven:** a decision routed *through the Kiro Crew gateway* to this endpoint
+— see [Troubleshooting](#troubleshooting) (the consent bound to the Jev default
+URL, so the gateway's decision failed `provider` in 2 ms and CloudWatch recorded
+**zero** invocations from it). Everything above is direct, signed boto3 calls.
+
+### Latency (35 calls, 0 errors)
 
 | Metric | Value |
 |---|---|
-| Invocations / errors | **35 / 0** |
-| Request / response body | **660 B / 492 B** |
-| Cold start (1st call) | **~3019 ms** |
-| Warm p50 | **2894 ms** |
-| Warm p90 | **2933 ms** |
-| Warm p99 | **3031 ms** |
+| Request / response body | 660 B / 492 B |
+| Cold start (1st call) | ~3019 ms |
+| Warm p50 / p90 / p99 | **2894 / 2933 / 3031 ms** |
 | Warm mean (34 calls) | 2903 ms |
-| Input / output tokens (1st answer) | 232 / 3 |
 
-A sample answer to the `verify.py` body (a choice question) came back with a
-full probability distribution — e.g. `action: "hold"` with
-`{merge: 0.14, hold: 0.43, request_changes: 0.43}`, plus `noul` and `score`
-answers — confirming the endpoint speaks Kiro Crew's exact `/v1/systemone`
-protocol. The least-privilege invoke-only role was proven end to end:
-`InvokeEndpoint` **succeeded** under the assumed role while `DescribeEndpoint`
-was **denied**, exactly as scoped.
+A 30-call warm window cross-checked against CloudWatch breaks the ~2.8 s round
+trip down: **ModelLatency ~2139 ms** (container compute) + **OverheadLatency
+~5 ms** (SageMaker) + **~620 ms** network India↔ap-south-1. Run it from the same
+region to cut the network leg.
 
-> **Cost of this run:** the endpoint existed for well under an hour (one smoke
-> call, the 35-call benchmark, and the invoke-proof — 37 `InvokeEndpoint` calls
-> total per CloudWatch), so at **$0.485/hr** the hosting cost was **under $1**.
-> The $10 monthly Budget guarded it. Left running, the same endpoint is ~$354/mo
-> (see [Cost](#cost)) — which is why `cleanup.sh` runs at the end.
+### Latency follows the number of questions (payload sweep, 15 calls each)
+
+| Request size | p50 |
+|---|---|
+| 220 B | 893 ms |
+| 655 B | 2937 ms |
+| 3155 B | 8917 ms |
+
+Bigger bodies mean more questions in one call, and the CPU model answers them
+in sequence — so latency scales with question count, not just bytes.
+
+### The container serializes requests — scale with instances, not concurrency
+
+40 calls at each concurrency level, **0 errors** throughout, but throughput is
+flat while p50 climbs linearly:
+
+| Concurrent callers | Throughput | p50 |
+|---|---|---|
+| 1 | 0.36 req/s | 2.8 s |
+| 2 | 0.38 req/s | 5.3 s |
+| 4 | 0.28 req/s | 14.4 s |
+| 8 | 0.29 req/s | 27.2 s |
+
+One `ml.m5.2xlarge` handles ~0.3–0.4 req/s regardless of how many callers pile
+on; extra callers just queue. To serve more, add instances (raise
+`InitialInstanceCount` / use autoscaling), don't push concurrency at one instance.
+
+### Cost of this run
+
+| Item | Duration | Cost |
+|---|---|---|
+| Endpoint (attempt 1 broken image + attempt 2 working) | 74.2 min = **1.236 hr** × $0.485 | **$0.60** |
+| CodeBuild (2 builds, `GENERAL1_SMALL`) | ~5 min | ~$0.03 |
+| S3 / ECR storage | — | <$0.01 |
+| **Total** | | **≈ $0.63** |
+
+The $10 monthly Budget guarded it. Left running, the same endpoint is ~$354/mo
+(see [Cost](#cost)) — which is why `cleanup.sh` runs at the end.
 
 ## What CloudFormation creates
 
@@ -204,12 +257,19 @@ hard stop — AWS Budgets **alert**, they do not cap spend, so tear down promptl
   on the hard tier (measured on one 10-core CPU host — a measurement, not a
   guarantee). It is a smaller model; expect it to miss some decisions Jev gets.
 - **Latency.** CPU inference of a 2B model is **seconds, not milliseconds** — this
-  deployment measured warm **p50 2894 ms / p90 2933 ms / p99 3031 ms** and a
-  ~3019 ms cold start (`benchmark.py`, 35 calls, 0 errors). That is fine for Kiro
-  Crew's decision cadence but not for interactive per-token use. It also exceeds
-  Kiro Crew's **default 1000 ms decision timeout**, so raise
+  deployment measured warm **p50 2894 / p90 2933 / p99 3031 ms** and a ~3019 ms
+  cold start (35 calls, 0 errors). The round trip breaks down as ~2139 ms container
+  compute + ~5 ms SageMaker overhead + ~620 ms network from India; latency also
+  scales with the number of questions in the body (220 B → ~0.9 s, 3155 B →
+  ~8.9 s). Fine for Kiro Crew's decision cadence, not for interactive per-token
+  use. It also exceeds Kiro Crew's **default 1000 ms decision timeout**, so raise
   `decisions.provider.timeout_ms` to ~5000 before routing live decisions (see
   Troubleshooting).
+- **One instance serializes requests.** A single `ml.m5.2xlarge` sustains only
+  ~0.3–0.4 req/s; concurrent callers queue rather than parallelize (p50 rose
+  2.8 s → 27 s from 1 → 8 callers, throughput flat, 0 errors). Scale out with more
+  instances (`InitialInstanceCount` / autoscaling), not more concurrency per
+  instance.
 - **Request size.** SageMaker real-time refuses a body over ~25 MB (Kiro Crew
   enforces a 25 MB client cap), which matters only for image/Box decisions.
 - **Null rubrics.** Kiro Crew may send an option rubric as JSON `null`; the strands
@@ -248,12 +308,27 @@ Real gaps hit while deploying and verifying this, and how each was fixed:
   consent card in the dashboard**, not by `config.json`. If the card was turned on
   while the endpoint was still the Jev default (`https://api.typesafe.ai/...`), the
   running gateway's consent keystone wins and overrides a `kirocrew config set
-  ... sagemaker://...`. Symptom in `~/.kiro/crew/decisions/decisions-<date>.jsonl`:
-  a decision line with `error: "provider"` and `latency_ms: 2` (a real SageMaker
-  call measures ~2900 ms and generates a CloudWatch `Invocations` data point — the
-  2 ms failure generates none). Fix: set the `sagemaker://` URL, then grant consent
-  for **that** endpoint string in the dashboard card. A `config set` alone cannot
-  grant it.
+  ... sagemaker://...`. That is exactly what happened on the author's run: the
+  gateway decision fired (`point: skills.select`) but failed `error: "provider"`
+  with `latency_ms: 2`, and CloudWatch recorded **zero** invocations from it — the
+  call never reached the endpoint. **Do it in this order:**
+  1. `kirocrew config set decisions.provider.endpoint "sagemaker://<name>?region=<r>"`
+  2. `kirocrew config set decisions.provider.timeout_ms 5000`
+  3. **then** grant Decisions consent in the dashboard card, so consent binds to
+     the `sagemaker://` URL (not to the Jev default).
+  4. Trigger a decision and check the newest
+     `~/.kiro/crew/decisions/decisions-YYYYMMDD.jsonl` line for `latency_ms` in the
+     **thousands** and **no `error` field** — that is the signal the endpoint
+     answered. *(This gateway-routed step is not yet verified by the author; the
+     endpoint itself is proven by 37 direct signed `InvokeEndpoint` calls.)*
+- **`CreateModel` fails with a misleading "role is invalid".** A SageMaker
+  execution role created in the console often carries the IAM path
+  `/service-role/`, so its real ARN is
+  `arn:aws:iam::<account>:role/service-role/<RoleName>` — the no-path
+  `.../role/<RoleName>` ARN is rejected. Get the exact ARN with
+  `aws iam get-role --role-name <RoleName> --query Role.Arn`. (The CloudFormation
+  template here creates its own exec role without that path, so this bites only
+  when you reuse a console-made role.)
 - **GPU instance type rejected at endpoint creation.** `ml.g4dn.xlarge` endpoint
   usage is often quota 0 on a new account — request a quota increase first, or stay
   on `ml.m5.2xlarge`.
