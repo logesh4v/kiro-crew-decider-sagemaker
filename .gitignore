@@ -2,11 +2,15 @@
 # verified by weights/download_weights.py from the pinned manifest. They never
 # belong in git.
 weights/files/
-weights/model.tar.gz
 weights/checksums.json
+*.tar.gz
 
 # Build context produced by deploy.sh
 source.zip
+
+# Secrets / local env
+.env
+.env.*
 
 # Python / tooling
 __pycache__/

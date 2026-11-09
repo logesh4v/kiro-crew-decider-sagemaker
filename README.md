@@ -39,10 +39,19 @@ scripts/
   benchmark.py        N invocations, p50/p90/p99, cold vs warm
   connect_kiro_crew.md  point Kiro Crew at the endpoint + restore
   cleanup.sh          delete everything, then verify each resource is gone
+docs/
+  diagram.png         architecture diagram
 LICENSE             MIT (author: S Logesh)
 ```
 
 ## Architecture
+
+![Kiro Crew decision model on a SageMaker real-time endpoint](docs/diagram.png)
+
+*Kiro Crew's decision gate signs each decision with SigV4 and calls
+`InvokeEndpoint` on a SageMaker real-time endpoint in your account. The container
+(image from Amazon ECR, weights from Amazon S3) answers the same `/v1/systemone`
+body. An IAM policy allows `InvokeEndpoint` on that one endpoint ARN only.*
 
 ```
                  build time                          serve time
@@ -105,6 +114,37 @@ python3 scripts/benchmark.py --endpoint cb-speedrun-2-decider --region ap-south-
 then re-deploys with `CreateEndpoint=true` to create the model + endpoint — so you
 never pay for an endpoint before the image and weights exist.
 
+## Results
+
+Measured on a real deployment in `ap-south-1` on an `ml.m5.2xlarge` endpoint
+(2026-11-09). The endpoint was torn down right after — these are the numbers you
+should expect to reproduce, not a live service.
+
+| Metric | Value |
+|---|---|
+| Invocations / errors | **35 / 0** |
+| Request / response body | **660 B / 492 B** |
+| Cold start (1st call) | **~3019 ms** |
+| Warm p50 | **2894 ms** |
+| Warm p90 | **2933 ms** |
+| Warm p99 | **3031 ms** |
+| Warm mean (34 calls) | 2903 ms |
+| Input / output tokens (1st answer) | 232 / 3 |
+
+A sample answer to the `verify.py` body (a choice question) came back with a
+full probability distribution — e.g. `action: "hold"` with
+`{merge: 0.14, hold: 0.43, request_changes: 0.43}`, plus `noul` and `score`
+answers — confirming the endpoint speaks Kiro Crew's exact `/v1/systemone`
+protocol. The least-privilege invoke-only role was proven end to end:
+`InvokeEndpoint` **succeeded** under the assumed role while `DescribeEndpoint`
+was **denied**, exactly as scoped.
+
+> **Cost of this run:** the endpoint existed for well under an hour (one smoke
+> call, the 35-call benchmark, and the invoke-proof — 37 `InvokeEndpoint` calls
+> total per CloudWatch), so at **$0.485/hr** the hosting cost was **under $1**.
+> The $10 monthly Budget guarded it. Left running, the same endpoint is ~$354/mo
+> (see [Cost](#cost)) — which is why `cleanup.sh` runs at the end.
+
 ## What CloudFormation creates
 
 One template, `infra/template.yaml` (validated with `cfn-lint`), creates:
@@ -163,10 +203,13 @@ hard stop — AWS Budgets **alert**, they do not cap spend, so tear down promptl
   Strands Decider 2B matched **~84%** of Jev's correct answers overall and **~69%**
   on the hard tier (measured on one 10-core CPU host — a measurement, not a
   guarantee). It is a smaller model; expect it to miss some decisions Jev gets.
-- **Latency.** First call to a fresh instance pays a cold-start cost;
-  `benchmark.py` reports it separately from warm p50/p90/p99. CPU inference of a 2B
-  model is seconds, not milliseconds — fine for Kiro Crew's decision cadence, not
-  for interactive per-token use. Fill in your measured numbers from `benchmark.py`.
+- **Latency.** CPU inference of a 2B model is **seconds, not milliseconds** — this
+  deployment measured warm **p50 2894 ms / p90 2933 ms / p99 3031 ms** and a
+  ~3019 ms cold start (`benchmark.py`, 35 calls, 0 errors). That is fine for Kiro
+  Crew's decision cadence but not for interactive per-token use. It also exceeds
+  Kiro Crew's **default 1000 ms decision timeout**, so raise
+  `decisions.provider.timeout_ms` to ~5000 before routing live decisions (see
+  Troubleshooting).
 - **Request size.** SageMaker real-time refuses a body over ~25 MB (Kiro Crew
   enforces a 25 MB client cap), which matters only for image/Box decisions.
 - **Null rubrics.** Kiro Crew may send an option rubric as JSON `null`; the strands
@@ -175,32 +218,61 @@ hard stop — AWS Budgets **alert**, they do not cap spend, so tear down promptl
 
 ## Troubleshooting
 
-Drawn from the gaps hit while building this (`results/RESULTS.md`):
+Real gaps hit while deploying and verifying this, and how each was fixed:
 
-- **`NoSuchBucket` right after creating it.** An S3 `create-bucket`/`mb` in a
-  non–us-east-1 region must set the region's `LocationConstraint`; a bucket in the
-  wrong region (or not actually created) surfaces later as `NoSuchBucket` on
-  upload. The CloudFormation template creates the bucket in the stack's region, so
-  deploy via the template rather than a manual `mb`, and confirm with
-  `aws s3api head-bucket --bucket <name> --region <region>` before uploading.
-- **SageMaker can't read `model.tar.gz` (`AccessDenied` / model create fails).**
+- **Container crash-loops immediately (SageMaker "ping health check failed").**
+  SageMaker starts the container as `docker run <image> serve`, appending `serve`
+  as an argument. An **exec-form** `ENTRYPOINT ["python","-m","uvicorn",...]` hands
+  that trailing `serve` straight to uvicorn, which rejects it with "unexpected
+  extra argument serve" and exits — over and over. The fix (already in
+  `container/Dockerfile`) is a shell entrypoint that swallows the arg:
+  `ENTRYPOINT ["sh","-c","exec python -m uvicorn serve:app --host 0.0.0.0 --port 8080 --log-level warning"]`
+  — `serve` becomes the shell's `$0` and is ignored.
+- **SageMaker can't read `model.tar.gz` (`AccessDenied`, model/endpoint fails).**
   The managed `AmazonSageMakerFullAccess` only grants S3 on `*sagemaker*`-named
-  buckets. This stack's bucket isn't named that, so the template's own execution
-  role grants `s3:GetObject` on the bucket explicitly — use that role, not a stock
-  one, or the model will fail to pull its weights.
-- **CodeBuild can't build the image.** `docker build` needs the Docker daemon, so
-  the project must run with `PrivilegedMode: true` (it does). If the push fails,
-  check the role has `ecr:GetAuthorizationToken` (on `*`) plus the push actions on
-  the repo ARN.
+  buckets, and this stack's bucket isn't one. Diagnose it precisely with
+  `aws iam simulate-principal-policy --policy-source-arn <exec-role> --action-names s3:GetObject --resource-arns arn:aws:s3:::<bucket>/model/*`
+  (it returns `implicitDeny`). The template's own exec role grants `s3:GetObject`
+  on the bucket explicitly, so use that role — not a stock one.
+- **The bucket must exist before you upload.** A manual `aws s3 mb` in a
+  non–us-east-1 region needs the region's `LocationConstraint`, and a bucket that
+  wasn't actually created surfaces later as `NoSuchBucket` on upload. Deploy via
+  the template (which creates the bucket in the stack's region) and confirm with
+  `aws s3api head-bucket --bucket <name> --region <region>` before uploading.
+- **Kiro Crew's decision times out before the endpoint answers.** The default
+  decision timeout is **1000 ms**, but a real CPU call to this endpoint takes
+  **~2900 ms**, so every decision times out and falls back. Raise it:
+  `kirocrew config set decisions.provider.timeout_ms 5000`.
+- **Kiro Crew keeps calling Jev even after you set the `sagemaker://` endpoint.**
+  Consent binds to the endpoint **string**, and it is granted by the **Decisions
+  consent card in the dashboard**, not by `config.json`. If the card was turned on
+  while the endpoint was still the Jev default (`https://api.typesafe.ai/...`), the
+  running gateway's consent keystone wins and overrides a `kirocrew config set
+  ... sagemaker://...`. Symptom in `~/.kiro/crew/decisions/decisions-<date>.jsonl`:
+  a decision line with `error: "provider"` and `latency_ms: 2` (a real SageMaker
+  call measures ~2900 ms and generates a CloudWatch `Invocations` data point — the
+  2 ms failure generates none). Fix: set the `sagemaker://` URL, then grant consent
+  for **that** endpoint string in the dashboard card. A `config set` alone cannot
+  grant it.
 - **GPU instance type rejected at endpoint creation.** `ml.g4dn.xlarge` endpoint
   usage is often quota 0 on a new account — request a quota increase first, or stay
   on `ml.m5.2xlarge`.
 - **Weights sha256 mismatch.** `download_weights.py` exits non-zero and
   `package_model.sh` refuses to package. Delete the bad file under `weights/files/`
   and re-run the download; the pins in `manifest.json` are authoritative.
-- **Kiro Crew still hits `api.typesafe.ai`.** The `sagemaker://` parser is strict
-  (`sagemaker://<name>?region=<r>[&profile=<p>]`); a malformed string is ignored.
-  Confirm the exact value and that `decisions.enabled` is `true`.
+
+## Clean up
+
+When you're done, delete every resource and verify it's gone:
+
+```bash
+./scripts/cleanup.sh ap-south-1 cb-speedrun-2-decider
+```
+
+It deletes the endpoint first (stops billing), then the endpoint-config, model,
+ECR images, and the CloudFormation stack (bucket, repo, CodeBuild, roles,
+invoke-only policy, Budget), then prints a `gone:` / `STILL PRESENT:` line per
+resource. It is idempotent — safe to re-run after a partial failure.
 
 ## License
 

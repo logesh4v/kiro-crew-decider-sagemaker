@@ -21,6 +21,8 @@ COPY serve.py /app/serve.py
 
 EXPOSE 8080
 
-# SageMaker starts the container with `docker run <image> serve`. We ignore the
-# arg and launch uvicorn on 8080 (the port SageMaker probes for /ping).
-ENTRYPOINT ["python", "-m", "uvicorn", "serve:app", "--host", "0.0.0.0", "--port", "8080", "--log-level", "warning"]
+# SageMaker starts the container with `docker run <image> serve`, so "serve" is
+# appended as an argument. With `sh -c "<cmd>"`, that trailing "serve" becomes the
+# shell's $0 and is ignored, so uvicorn never sees it. (The exec form passed the
+# arg straight to uvicorn, which rejected it with "unexpected extra argument serve".)
+ENTRYPOINT ["sh", "-c", "exec python -m uvicorn serve:app --host 0.0.0.0 --port 8080 --log-level warning"]
